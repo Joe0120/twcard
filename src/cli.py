@@ -21,6 +21,12 @@ def main() -> None:
     run_parser.add_argument(
         "--skip-download", action="store_true", help="Skip download step"
     )
+    run_parser.add_argument(
+        "--skip-notify", action="store_true", help="Skip reminder notifications"
+    )
+
+    # notify only
+    subparsers.add_parser("notify", help="Create reminders from existing CSV")
 
     args = parser.parse_args()
 
@@ -39,9 +45,19 @@ def main() -> None:
         from .pipeline import parse_all
         parse_all()
 
+    elif args.command == "notify":
+        from .notifier import create_reminders
+        from .pipeline import load_results
+        try:
+            results = load_results()
+        except FileNotFoundError:
+            logging.error("No statements CSV found. Run 'parse' first.")
+            return
+        create_reminders(results)
+
     elif args.command == "run":
         from .pipeline import run
-        run(skip_download=args.skip_download)
+        run(skip_download=args.skip_download, skip_notify=args.skip_notify)
 
 
 if __name__ == "__main__":

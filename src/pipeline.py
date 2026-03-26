@@ -96,8 +96,28 @@ def parse_all(pdf_dir: Path | None = None, output: Path | None = None) -> list[d
     return results
 
 
-def run(skip_download: bool = False) -> list[dict]:
-    """Full pipeline: download then parse."""
+def load_results(path: Path | None = None) -> list[dict]:
+    """Load parsed results from CSV, converting amount to int."""
+    path = path or OUTPUT_CSV
+    with open(path, encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        try:
+            r["amount"] = int(r["amount"])
+        except (ValueError, KeyError):
+            r["amount"] = 0
+    return rows
+
+
+def run(skip_download: bool = False, skip_notify: bool = False) -> list[dict]:
+    """Full pipeline: download -> parse -> notify."""
     if not skip_download:
         download_pdfs()
-    return parse_all()
+    results = parse_all()
+    if not skip_notify:
+        try:
+            from .notifier import create_reminders
+            create_reminders(results)
+        except Exception:
+            logger.exception("Failed to create reminders")
+    return results
