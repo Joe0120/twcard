@@ -1,0 +1,12 @@
+credentials.json
+token.json
+passwords.json
+.env
+*.decrypted.pdf
+__pycache__/
+*.pyc
+data/
+statements.csv
+pdfs/
+firebase-debug.log
+.DS_Store
