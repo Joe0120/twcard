@@ -1,28 +1,34 @@
-"""Payment reminders for upcoming credit card due dates.
-
-On macOS: uses AppleScript to create native Reminders.
-On Linux: uses CalDAV to create iCloud Reminders.
-"""
+"""Payment reminders via Google Tasks API."""
 
 import logging
-import os
-import platform
-import subprocess
+import re
 from datetime import date, datetime
 
+from googleapiclient.discovery import build
+
+from .gmail_downloader import get_gmail_credentials
 from .parsers import NO_PAYMENT
 
 logger = logging.getLogger(__name__)
 
-REMINDER_LIST = "信用卡繳費"
+TASK_LIST_TITLE = "信用卡繳費"
 
 
 def _sanitize(text: str) -> str:
-    """Remove characters that could cause injection in AppleScript or iCalendar."""
-    return text.replace('"', "").replace("\\", "").replace("\r", "").replace("\n", "")
+    """Remove characters that could cause issues."""
+    return text.replace("\r", "").replace("\n", "")
 
 
-# ── Shared logic ─────────────────────────────────────────────────────────
+def _get_bank_code(bank: str) -> str:
+    """Extract leading bank code, e.g. '808' from '808 玉山銀行'."""
+    m = re.match(r"(\d+)", bank)
+    return m.group(1) if m else bank
+
+
+def _task_key(bank: str, due: date) -> str:
+    """Dedup key: bank_code + due_date."""
+    return f"{_get_bank_code(bank)}:{due.isoformat()}"
+
 
 def _collect_pending(results: list[dict]) -> list[tuple[date, str, int]]:
     """Filter unpaid statements with future due dates, sorted nearest first."""
@@ -50,161 +56,55 @@ def _collect_pending(results: list[dict]) -> list[tuple[date, str, int]]:
     return pending
 
 
-# ── macOS: AppleScript ───────────────────────────────────────────────────
+def _get_or_create_tasklist(service) -> str:
+    """Find or create the task list, return its ID."""
+    results = service.tasklists().list().execute()
+    for tl in results.get("items", []):
+        if tl["title"] == TASK_LIST_TITLE:
+            return tl["id"]
 
-def _applescript_create(pending: list[tuple[date, str, int]]) -> int:
-    """Create reminders via AppleScript on macOS."""
-    safe_list = _sanitize(REMINDER_LIST)
-
-    # Ensure list exists
-    result = subprocess.run(
-        ["osascript", "-e", f'''
-        tell application "Reminders"
-            if not (exists list "{safe_list}") then
-                make new list with properties {{name:"{safe_list}"}}
-            end if
-        end tell
-        '''],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        logger.error("Cannot create/verify reminder list: %s", result.stderr.strip())
-        return 0
-
-    # Clear all reminders in list
-    subprocess.run(
-        ["osascript", "-e", f'''
-        tell application "Reminders"
-            tell list "{safe_list}"
-                delete every reminder
-            end tell
-        end tell
-        '''],
-        capture_output=True, text=True,
-    )
-
-    # Build all reminders in a single AppleScript call
-    if not pending:
-        return 0
-
-    make_lines = []
-    for due, bank, amount in pending:
-        title = _sanitize(f"{bank} ${amount:,}")
-        date_str = due.strftime("%Y/%m/%d")
-        make_lines.append(
-            f'make new reminder with properties {{name:"{title}", due date:date "{date_str}"}}'
-        )
-
-    script = f'''
-    tell application "Reminders"
-        tell list "{safe_list}"
-            {chr(10).join(make_lines)}
-        end tell
-    end tell
-    '''
-
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True, text=True,
-    )
-
-    if result.returncode == 0:
-        for due, bank, amount in pending:
-            logger.info("  %s $%s (due %s)", bank, f"{amount:,}", due)
-        return len(pending)
-
-    logger.error("Failed to create reminders: %s", result.stderr.strip())
-    return 0
+    tl = service.tasklists().insert(body={"title": TASK_LIST_TITLE}).execute()
+    logger.info("Created task list: %s", TASK_LIST_TITLE)
+    return tl["id"]
 
 
-# ── Linux: CalDAV ────────────────────────────────────────────────────────
+def _get_existing_keys(service, tasklist_id: str) -> set[str]:
+    """Get dedup keys (bank_code:due_date) from existing tasks."""
+    keys: set[str] = set()
+    page_token = None
 
-def _caldav_create(pending: list[tuple[date, str, int]]) -> int:
-    """Create reminders via CalDAV (iCloud)."""
-    try:
-        import caldav
-    except ImportError:
-        logger.error("caldav package not installed, run: pip install caldav")
-        return 0
+    while True:
+        resp = service.tasks().list(
+            tasklist=tasklist_id,
+            showCompleted=True,
+            showHidden=True,
+            pageToken=page_token,
+        ).execute()
 
-    apple_id = os.environ.get("APPLE_ID")
-    apple_pw = os.environ.get("APPLE_APP_PASSWORD")
-    if not apple_id or not apple_pw:
-        logger.warning("APPLE_ID or APPLE_APP_PASSWORD not set, skipping reminders")
-        return 0
+        for task in resp.get("items", []):
+            title = task.get("title", "")
+            due_raw = task.get("due", "")
 
-    try:
-        client = caldav.DAVClient(
-            url="https://caldav.icloud.com/",
-            username=apple_id,
-            password=apple_pw,
-        )
-        principal = client.principal()
-    except Exception:
-        logger.exception("CalDAV authentication failed")
-        return 0
-
-    # Find a list that accepts VTODO
-    target = None
-    for cal in principal.calendars():
-        try:
-            probe = (
-                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"
-                "BEGIN:VTODO\r\nSUMMARY:__probe__\r\n"
-                "STATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR"
-            )
-            obj = cal.save_event(probe)
-            obj.delete()
-            target = cal
-            break
-        except Exception:
-            continue
-
-    if not target:
-        logger.error("No writable reminder list found on iCloud")
-        return 0
-
-    logger.info("Using CalDAV list: %s", target.get_display_name())
-
-    # Clear only VTODO items (avoid deleting calendar events)
-    try:
-        for obj in target.objects():
-            try:
-                if obj.data and "VTODO" in obj.data:
-                    obj.delete()
-            except Exception:
+            code_match = re.match(r"(\d+)", title)
+            if not code_match or not due_raw:
                 continue
-    except Exception:
-        pass
 
-    # Create reminders
-    created = 0
-    for due, bank, amount in pending:
-        title = _sanitize(f"{bank} ${amount:,}")
-        vtodo = (
-            "BEGIN:VCALENDAR\r\n"
-            "VERSION:2.0\r\n"
-            "BEGIN:VTODO\r\n"
-            f"SUMMARY:{title}\r\n"
-            f"DUE;VALUE=DATE:{due.strftime('%Y%m%d')}\r\n"
-            "STATUS:NEEDS-ACTION\r\n"
-            "END:VTODO\r\n"
-            "END:VCALENDAR"
-        )
-        try:
-            target.save_event(vtodo)
-            created += 1
-            logger.info("  %s (due %s)", title, due)
-        except Exception:
-            logger.exception("  Failed: %s", title)
+            try:
+                due = datetime.fromisoformat(due_raw.replace("Z", "+00:00")).date()
+            except (ValueError, TypeError):
+                continue
 
-    return created
+            keys.add(f"{code_match.group(1)}:{due.isoformat()}")
 
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
 
-# ── Public API ───────────────────────────────────────────────────────────
+    return keys
+
 
 def create_reminders(results: list[dict]) -> int:
-    """Create payment reminders. Uses AppleScript on macOS, CalDAV on Linux."""
+    """Create payment reminders in Google Tasks. Skip duplicates."""
     pending = _collect_pending(results)
 
     if not pending:
@@ -213,10 +113,31 @@ def create_reminders(results: list[dict]) -> int:
 
     logger.info("Found %d upcoming payments", len(pending))
 
-    if platform.system() == "Darwin":
-        created = _applescript_create(pending)
-    else:
-        created = _caldav_create(pending)
+    creds = get_gmail_credentials()
+    service = build("tasks", "v1", credentials=creds)
 
-    logger.info("Created %d reminders", created)
+    tasklist_id = _get_or_create_tasklist(service)
+    existing = _get_existing_keys(service, tasklist_id)
+
+    created = 0
+    for due, bank, amount in pending:
+        key = _task_key(bank, due)
+        if key in existing:
+            logger.debug("Skip existing: %s $%s (due %s)", bank, f"{amount:,}", due)
+            continue
+
+        title = _sanitize(f"{bank} ${amount:,}")
+        service.tasks().insert(
+            tasklist=tasklist_id,
+            body={
+                "title": title,
+                "due": f"{due.isoformat()}T00:00:00.000Z",
+            },
+        ).execute()
+
+        created += 1
+        logger.info("  %s $%s (due %s)", bank, f"{amount:,}", due)
+
+    logger.info("Created %d new reminders (skipped %d existing)",
+                created, len(pending) - created)
     return created

@@ -22,7 +22,10 @@ OUTPUT_CSV = PROJECT_ROOT / "statements.csv"
 
 # ── Gmail ──────────────────────────────────────────────────────────────────
 import os as _os
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/tasks",
+]
 # 多個標籤用逗號分隔，例如: "銀行/信用卡帳單,銀行/對帳單"
 GMAIL_LABELS = [
     s.strip() for s in
