@@ -132,10 +132,11 @@ def run(skip_download: bool = False, skip_notify: bool = False) -> list[dict]:
     if not skip_download:
         download_pdfs()
     new_results = parse_all()
-    if not skip_notify and new_results:
-        try:
-            from .notifier import create_reminders
-            create_reminders(new_results)
-        except Exception:
-            logger.exception("Failed to create reminders")
+    # TODO: re-enable notify after full re-download
+    # if not skip_notify and new_results:
+    #     try:
+    #         from .notifier import create_reminders
+    #         create_reminders(new_results)
+    #     except Exception:
+    #         logger.exception("Failed to create reminders")
     return new_results
