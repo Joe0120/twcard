@@ -120,11 +120,12 @@ def create_reminders(results: list[dict]) -> int:
     existing = _get_existing_keys(service, tasklist_id)
 
     created = 0
+    seen: set[str] = set()
     for due, bank, amount in pending:
         key = _task_key(bank, due)
-        if key in existing:
-            logger.debug("Skip existing: %s $%s (due %s)", bank, f"{amount:,}", due)
+        if key in existing or key in seen:
             continue
+        seen.add(key)
 
         title = _sanitize(f"{bank} ${amount:,}")
         service.tasks().insert(
