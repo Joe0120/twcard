@@ -31,8 +31,7 @@ def _task_key(bank: str, due: date) -> str:
 
 
 def _collect_pending(results: list[dict]) -> list[tuple[date, str, int]]:
-    """Filter unpaid statements with future due dates, sorted nearest first."""
-    today = date.today()
+    """Filter statements with positive amount, sorted by due date."""
     pending: list[tuple[date, str, int]] = []
 
     for row in results:
@@ -45,9 +44,6 @@ def _collect_pending(results: list[dict]) -> list[tuple[date, str, int]]:
         try:
             due = datetime.strptime(due_str, "%Y/%m/%d").date()
         except (ValueError, TypeError):
-            continue
-
-        if due < today:
             continue
 
         pending.append((due, row["bank"], amount))
