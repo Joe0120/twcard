@@ -44,8 +44,16 @@ def _parse_single_pdf(
         return None
 
 
+def _load_existing_files(output: Path) -> set[str]:
+    """Load already-parsed filenames from CSV."""
+    if not output.exists():
+        return set()
+    with open(output, encoding="utf-8-sig") as f:
+        return {row["file"] for row in csv.DictReader(f)}
+
+
 def parse_all(pdf_dir: Path | None = None, output: Path | None = None) -> list[dict]:
-    """Parse all PDFs in bank subdirectories. Returns list of result dicts."""
+    """Parse new PDFs only, append to CSV. Returns only new results."""
     pdf_dir = pdf_dir or DOWNLOAD_DIR
     output = output or OUTPUT_CSV
 
@@ -53,7 +61,8 @@ def parse_all(pdf_dir: Path | None = None, output: Path | None = None) -> list[d
         logger.warning("PDF directory does not exist: %s", pdf_dir)
         return []
 
-    results: list[dict] = []
+    existing_files = _load_existing_files(output)
+    new_results: list[dict] = []
     futures: dict = {}
     bank_stats: dict[str, list[int]] = {}
 
@@ -67,6 +76,8 @@ def parse_all(pdf_dir: Path | None = None, output: Path | None = None) -> list[d
             bank_stats[bank] = [0, 0]
 
             for pdf_path in list_pdfs(pdf_dir / bank):
+                if pdf_path.name in existing_files:
+                    continue
                 fut = executor.submit(
                     _parse_single_pdf, pdf_path, bank, parser_func, method
                 )
@@ -76,24 +87,31 @@ def parse_all(pdf_dir: Path | None = None, output: Path | None = None) -> list[d
             bank = futures[fut]
             result = fut.result()
             if result:
-                results.append(result)
+                new_results.append(result)
                 bank_stats[bank][0] += 1
             else:
                 bank_stats[bank][1] += 1
 
     for bank in sorted(bank_stats):
         s, f = bank_stats[bank]
-        logger.info("  %s: %d success, %d fail", bank, s, f)
+        if s or f:
+            logger.info("  %s: %d success, %d fail", bank, s, f)
 
-    results.sort(key=lambda r: (r["bank"], r["file"]))
+    new_results.sort(key=lambda r: (r["bank"], r["file"]))
 
-    with open(output, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=["bank", "file", "due_date", "amount"])
-        writer.writeheader()
-        writer.writerows(results)
+    if new_results:
+        write_header = not output.exists() or output.stat().st_size == 0
+        with open(output, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["bank", "file", "due_date", "amount"]
+            )
+            if write_header:
+                writer.writeheader()
+            writer.writerows(new_results)
 
-    logger.info("Output: %s (%d records)", output, len(results))
-    return results
+    logger.info("New: %d records (total in CSV: %d)",
+                len(new_results), len(existing_files) + len(new_results))
+    return new_results
 
 
 def load_results(path: Path | None = None) -> list[dict]:
@@ -113,11 +131,11 @@ def run(skip_download: bool = False, skip_notify: bool = False) -> list[dict]:
     """Full pipeline: download -> parse -> notify."""
     if not skip_download:
         download_pdfs()
-    results = parse_all()
-    if not skip_notify:
+    new_results = parse_all()
+    if not skip_notify and new_results:
         try:
             from .notifier import create_reminders
-            create_reminders(results)
+            create_reminders(new_results)
         except Exception:
             logger.exception("Failed to create reminders")
-    return results
+    return new_results
